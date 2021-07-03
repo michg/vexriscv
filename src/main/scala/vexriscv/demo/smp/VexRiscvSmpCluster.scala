@@ -268,6 +268,9 @@ object VexRiscvSmpClusterGen {
           zeroBoot = false,
           x0Init = true
         ),
+        new TracePlugin(
+          regcount = 2
+        ),
         new IntAluPlugin,
         new SrcPlugin(
           separatedAddSub = false
