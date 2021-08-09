@@ -7,6 +7,83 @@ import spinal.lib.com.uart._
 
 import scala.collection.mutable
 
+trait InterfaceKind
+object UART extends InterfaceKind
+object FT245ASY extends InterfaceKind 
+
+object WrStates extends SpinalEnum {
+    val idle, wrsetup, wractive = newElement()
+  }
+
+case class Ftxd() extends Bundle with IMasterSlave {
+  val data = out Bits(8 bits)
+  val xwr = out Bool()
+  val txe = in Bool()
+  override def asMaster(): Unit = {
+    in(data)
+    in(xwr)
+    out(txe)
+  }
+
+}
+
+
+case class FPar(){
+  val frq = ClockDomain.current.frequency.getValue.toDouble
+  val wrsetup = (5e-9*frq + 1).toInt 
+  val wrpulse = (30e-9*frq + 1).toInt
+}
+ 
+
+class Ft245(p: FPar = FPar()) extends Component{
+  val io = new Bundle{
+    val ftxd = Ftxd()
+    val tx = slave Stream (Bits(8 bit))
+  }
+ 
+  
+
+ val fsm = new Area {
+
+      import WrStates._
+      val cntNext = UInt(Math.max(log2Up(p.wrsetup), log2Up(p.wrpulse)) + 1 bit)
+      val cnt = RegNext(cntNext) init(0)
+      when(cnt =/= 0) { 
+        cntNext := cnt - 1
+       } otherwise {
+        cntNext := 0
+       }
+      val state = Reg(WrStates()) init (idle)
+      io.tx.ready := False
+      io.ftxd.data := io.tx.payload
+      io.ftxd.xwr := True
+      switch(state) {
+        is(idle) {
+          when(io.tx.valid && !io.ftxd.txe) {
+            state := wrsetup
+            cntNext := p.wrsetup - 1
+          }
+        }
+        is(wrsetup) {
+          when(cnt === 0) {
+           state := wractive
+           cntNext := p.wrpulse - 1
+          }
+        }
+        is(wractive) {
+          io.ftxd.xwr := False
+          when(cnt === 0) {
+           io.tx.ready := True
+           state :=idle
+          }
+        }
+      }
+  }
+}
+
+
+
+
 case class CRam(wordWidth: Int, wordCount: Int, inCount: Int, outCount: Int) extends BlackBox {
 
     // SpinalHDL will lock at Generic classes to get attributes which
@@ -100,10 +177,11 @@ class StreamFifoVar[T <: Data](dataType: HardType[T], depth: Int, inmaxsize: Int
 }
 
 
-class TracePlugin(regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
+class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
   import Riscv._
   import CsrAccess._ 
   var uart : Uart = null
+  var ftxd: Ftxd = null
   
   override def setup(pipeline: VexRiscv): Unit = {
   }
@@ -193,6 +271,7 @@ class TracePlugin(regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRisc
     tdata.valid := fifo.io.pop.valid
     fifo.io.pop.ready := tdata.ready
     
+    if(Tinterface == `UART`) {
     uart = master(Uart()).setName("uart") 
     
     val uartCtrl: UartCtrl = UartCtrl(
@@ -206,7 +285,12 @@ class TracePlugin(regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRisc
     uartCtrl.io.uart <> uart
     tdata >-> uartCtrl.io.write
 
-   
+   } else {
+     ftxd = Ftxd().setName("ftxd")
+     val ftdi = new Ft245()
+     ftdi.io.ftxd <> ftxd
+     tdata >-> ftdi.io.tx
+   }
     val writeStage = stages.last
 
         //Write register file
