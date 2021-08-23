@@ -6,14 +6,63 @@ import spinal.lib._
 import spinal.lib.com.uart._
 
 import scala.collection.mutable
+import spinal.lib.com.eth._ 
 
 trait InterfaceKind
 object UART extends InterfaceKind
-object FT245ASY extends InterfaceKind 
+object FT245ASY extends InterfaceKind
+object ETH100MII extends InterfaceKind
 
 object WrStates extends SpinalEnum {
     val idle, wrsetup, wractive = newElement()
   }
+
+
+case class MacEthTx(p : MacEthParameter,
+                  txCd : ClockDomain) extends Component {
+  val io = new Bundle {
+    val phy = master(PhyIo(p.phy))
+    val ctrl = MacEthCtrl(p)
+  }
+
+  val ctrlClockDomain = this.clockDomain
+
+
+  val txReset = ResetCtrl.asyncAssertSyncDeassert(
+    input = ClockDomain.current.isResetActive || io.ctrl.tx.flush,
+    clockDomain = txCd
+  )
+  val txClockDomain = txCd.copy(reset = txReset)
+
+  val txFrontend = new Area{
+    val buffer = MacTxBuffer(
+      pushCd = ctrlClockDomain.copy(softReset = io.ctrl.tx.flush),
+      popCd = txClockDomain,
+      pushWidth = p.rxDataWidth,
+      popWidth = p.phy.txDataWidth,
+      byteSize = p.txBufferByteSize
+    )
+    buffer.io.push.stream << io.ctrl.tx.stream
+    buffer.io.push.availability <> io.ctrl.tx.availability
+  }
+
+  val txBackend = txClockDomain on new Area{
+    val aligner = MacTxAligner(dataWidth = p.phy.rxDataWidth)
+    aligner.io.input << txFrontend.buffer.io.pop.stream
+    aligner.io.enable := BufferCC(io.ctrl.tx.alignerEnable)
+
+    val crc = MacTxCrc(dataWidth = p.phy.txDataWidth)
+    crc.io.input << aligner.io.output
+
+    val header = MacTxHeader(dataWidth = p.phy.txDataWidth)
+    header.io.input << crc.io.output
+    header.io.output >> io.phy.tx
+
+
+    txFrontend.buffer.io.pop.redo := False
+    txFrontend.buffer.io.pop.commit := RegNext(header.io.output.lastFire) init(False)
+  }
+}
 
 case class Ftxd() extends Bundle with IMasterSlave {
   val data = out Bits(8 bits)
@@ -177,11 +226,13 @@ class StreamFifoVar[T <: Data](dataType: HardType[T], depth: Int, inmaxsize: Int
 }
 
 
-class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
+class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
   import Riscv._
   import CsrAccess._ 
   var uart : Uart = null
   var ftxd: Ftxd = null
+  var mii : Mii = null
+
   
   override def setup(pipeline: VexRiscv): Unit = {
   }
@@ -192,7 +243,7 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
   import Riscv._ 
   
   val csrService = pipeline.service(classOf[CsrInterface])
-  val lastStage = pipeline.stages.last 
+  val lastStage = pipeline.stages.last
   val msample = pipeline plug new Area { 
    
     val msamplesel = RegInit(Vec.tabulate(regcount)(i=>B(i+12,5 bits)))
@@ -207,7 +258,11 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
         csrService.w(CSR.MSAMPLESEL, i*5 -> msamplesel(i))
     }
     csrService.w(CSR.MSAMPLEADR, triggeradr)
-    val fifo = new StreamFifoVar(Bits(slicebits bits), depth = 32, inmaxsize = wordcount*(regslices + headerslices), outsize=1 )
+    val inmaxsize = if(Tinterface == `ETH100MII`) wordcount*(regslices + headerslices) + 1 
+      else wordcount*(regslices + headerslices)
+
+    
+    val fifo = new StreamFifoVar(Bits(slicebits bits), depth = 32, inmaxsize = inmaxsize, outsize=1 )
     
     val insCounter = Reg(UInt(32 bits)) init(0)
     val lastinsCounter = Reg(UInt(32 bits)) init(0)
@@ -215,7 +270,7 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
     val regFile = RegInit(Vec.tabulate(regcount)(i=>B(0,32 bits)))
     val oldregFile = RegInit(Vec.tabulate(regcount)(i=>B(0,32 bits)))
     val data = Vec(Bits(32 bits), wordcount)
-    val res = Vec(Bits(slicebits bits), wordcount*(regslices + headerslices))
+    val res = Vec(Bits(slicebits bits), inmaxsize)
     var sizeacc = Vec(UInt(log2Up(wordcount*(regslices + headerslices)) bits), wordcount + 1)
     val size = Vec(UInt(slicebits bits), wordcount)
     val header = Vec(Bits(8 bits), wordcount)
@@ -232,17 +287,25 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
         size(i) := (OHToUInt(OHMasking.last(data(i))) >>  log2Up(slicebits)).resized
         header(i)(3 downto 0) := size(i).asBits.resized
        
-        for(j<- 0 until headerslices) {
-           res((sizeacc(i) + j).resized) := header(i).subdivideIn(slicebits bits)(j)
+      for(j<- 0 until headerslices) {
+           if(Tinterface == `ETH100MII`) res((sizeacc(i) + j + 1).resized) := header(i).subdivideIn(slicebits bits)(j) 
+           else res((sizeacc(i) + j).resized) := header(i).subdivideIn(slicebits bits)(j) 
       }
       for (j<- 0 until regslices) {
            when (j < (size(i) + 1)) {
-             res((sizeacc(i) + j + headerslices).resized) := data(i).subdivideIn(slicebits bits)(j)
+             if(Tinterface == `ETH100MII`) res((sizeacc(i) + j + headerslices + 1).resized) := data(i).subdivideIn(slicebits bits)(j)
+             else res((sizeacc(i) + j + headerslices).resized) := data(i).subdivideIn(slicebits bits)(j)
            }
        }
       sizeacc(i+1) := (sizeacc(i) + size(i) + headerslices + 1).resized
     }
-    fifo.io.incnt := sizeacc(wordcount)
+    res.allowOverride
+    if(Tinterface == `ETH100MII`)  {
+      res(0) := (sizeacc(wordcount) << log2Up(slicebits)).asBits.resized
+      fifo.io.incnt := (sizeacc(wordcount) + 1).resized
+    } else {
+      fifo.io.incnt := (sizeacc(wordcount)).resized
+    }
     fifo.io.push.payload := res
     fifo.io.push.valid := False
    
@@ -250,7 +313,7 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
     fifo.io.flush := ClockDomain.current.isResetActive
    
     csrService.onWrite(CSR.MSAMPLE) {
-     for (i <- 0 until regcount ) {
+    for (i <- 0 until regcount ) {
        oldregFile(i) := regFile(i)
      }
      lastinsCounter:=insCounter
@@ -271,12 +334,58 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
     tdata.valid := fifo.io.pop.valid
     fifo.io.pop.ready := tdata.ready
     
-    if(Tinterface == `UART`) {
-    uart = master(Uart()).setName("uart") 
+    if(Tinterface == `ETH100MII`) {
+
+    mii = master(Mii(
+      MiiParameter(
+        MiiTxParameter(
+          dataWidth = 4,
+          withEr    = true
+        ),
+        MiiRxParameter(
+          dataWidth = 4
+        )
+      )))
+       
+    val p = MacEthParameter(
+     phy = PhyParameter(
+        txDataWidth = 4,
+        rxDataWidth = 4
+      ),
+      rxDataWidth = 8,
+      rxBufferByteSize = 16,
+      txDataWidth = 8,
+      txBufferByteSize = 256
+    )
     
-    val uartCtrl: UartCtrl = UartCtrl(
-    config = UartCtrlInitConfig(
-     baudrate = 6250000, //3686400
+    val rxclk = in(Bool)
+    val txclk = in(Bool)
+    val txCd = ClockDomain(mii.TX.CLK)
+    val mac = new MacEthTx(p, txCd)
+    tdata >-> mac.io.ctrl.tx.stream
+    mac.io.ctrl.tx.flush := False
+    mac.io.ctrl.tx.alignerEnable := False
+      txCd.copy(reset = mac.txReset) on {
+        mii.TX.EN := RegNext(mac.io.phy.tx.valid)
+        mii.TX.D := RegNext(mac.io.phy.tx.data)
+        mac.io.phy.tx.ready := True 
+        mii.TX.ER := False
+      }
+    
+     
+   } 
+   else if (Tinterface == `FT245ASY`) {
+     ftxd = Ftxd()
+     val ftdi = new Ft245()
+     ftdi.io.ftxd <> ftxd
+     tdata >-> ftdi.io.tx
+   }
+   else {
+     uart = master(Uart()) 
+    
+     val uartCtrl: UartCtrl = UartCtrl(
+     config = UartCtrlInitConfig(
+      baudrate = 6250000, //3686400
      dataLength = 7,  // 8 bits
      parity = UartParityType.NONE,
      stop = UartStopType.TWO
@@ -284,13 +393,8 @@ class TracePlugin(Tinterface: InterfaceKind = FT245ASY, regcount: Int = 1, slice
     )
     uartCtrl.io.uart <> uart
     tdata >-> uartCtrl.io.write
-
-   } else {
-     ftxd = Ftxd().setName("ftxd")
-     val ftdi = new Ft245()
-     ftdi.io.ftxd <> ftxd
-     tdata >-> ftdi.io.tx
    }
+   
     val writeStage = stages.last
 
         //Write register file
