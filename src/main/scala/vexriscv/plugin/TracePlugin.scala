@@ -226,12 +226,14 @@ class StreamFifoVar[T <: Data](dataType: HardType[T], depth: Int, inmaxsize: Int
 }
 
 
-class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
+class TracePlugin(Tinterface: InterfaceKind = UART, regcount: Int = 1, slicebits : Int = 8) extends Plugin[VexRiscv]{
   import Riscv._
   import CsrAccess._ 
   var uart : Uart = null
   var ftxd: Ftxd = null
-  var mii : Mii = null
+  var miitx : MiiTx = null
+  var csel : Bits = null
+  
 
   
   override def setup(pipeline: VexRiscv): Unit = {
@@ -247,9 +249,10 @@ class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slic
   val msample = pipeline plug new Area { 
    
     val msamplesel = RegInit(Vec.tabulate(regcount)(i=>B(i+12,5 bits)))
-    val triggeradr = Reg(Bits(32 bits))
+    val triggeradr = Reg(Bits(32 bits)) init(0)
     val triggered = Reg(Bool) init(False)
     val msamplecmd = Reg(Bits(32 bits))
+    val coresel = Reg(Bits(4 bits))
     val wordcount = regcount + 1
     val regslices = 32 / slicebits
     val headerslices = 8 / slicebits
@@ -258,6 +261,9 @@ class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slic
         csrService.w(CSR.MSAMPLESEL, i*5 -> msamplesel(i))
     }
     csrService.w(CSR.MSAMPLEADR, triggeradr)
+    csrService.w(CSR.MSAMPLECSEL, coresel)
+    csel = out(Bits(4 bits))
+    csel := coresel
     val inmaxsize = if(Tinterface == `ETH100MII`) wordcount*(regslices + headerslices) + 1 
       else wordcount*(regslices + headerslices)
 
@@ -335,18 +341,12 @@ class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slic
     fifo.io.pop.ready := tdata.ready
     
     if(Tinterface == `ETH100MII`) {
-
-    mii = master(Mii(
-      MiiParameter(
+    miitx = master(MiiTx(
         MiiTxParameter(
           dataWidth = 4,
           withEr    = true
-        ),
-        MiiRxParameter(
-          dataWidth = 4
-        )
-      )))
-       
+        )))
+    
     val p = MacEthParameter(
      phy = PhyParameter(
         txDataWidth = 4,
@@ -360,16 +360,16 @@ class TracePlugin(Tinterface: InterfaceKind = ETH100MII, regcount: Int = 1, slic
     
     val rxclk = in(Bool)
     val txclk = in(Bool)
-    val txCd = ClockDomain(mii.TX.CLK)
+    val txCd = ClockDomain(miitx.CLK)
     val mac = new MacEthTx(p, txCd)
     tdata >-> mac.io.ctrl.tx.stream
     mac.io.ctrl.tx.flush := False
     mac.io.ctrl.tx.alignerEnable := False
       txCd.copy(reset = mac.txReset) on {
-        mii.TX.EN := RegNext(mac.io.phy.tx.valid)
-        mii.TX.D := RegNext(mac.io.phy.tx.data)
+        miitx.EN := RegNext(mac.io.phy.tx.valid)
+        miitx.D := RegNext(mac.io.phy.tx.data)
         mac.io.phy.tx.ready := True 
-        mii.TX.ER := False
+        miitx.ER := False
       }
     
      
