@@ -216,8 +216,9 @@ object Riscv{
     def MINSTRETH = 0xB82 // MRW Upper 32 bits of minstret, RV32I only.
     def MSAMPLE    = 0x7D0 
     def MSAMPLESEL = 0x7D1 
-    def MSAMPLEADR = 0x7D2 
-    def MSAMPLECSEL = 0x7D3 
+    def MSAMPLECSEL = 0x7D3
+    def MSAMPLETABCFG = 0x7D4
+    def MSAMPLETABDAT = 0x7D5  
 
     val SSTATUS     = 0x100
     val SIE         = 0x104
